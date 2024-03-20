@@ -151,4 +151,70 @@ Model flux_scene_load_model(const char* path){
 }
 ```
 
-Next up: Prefabs and GameObjects!
+Next up: Scripts!
+
+## Day 2: Scripts
+Ok, so we need a way to write scripts that will do stuff with game objects. We should be able to attach an arbitrary script to an arbitrary game object. If we were writing this in C++, we would maybe have each script inherit from a base `script` class and then use virtual dispatch.
+
+But we aren't doing that. So, lets do a hacky thing with macros and a python script. This keeps us in C world, but also should be faster than virtual dispatch - we can do everything with switch statements.
+
+My basic idea is that I want to be able to write a script (for example in `my_script.c`) where I can just fill in certain callback functions. For example, something like
+```c
+void onInit(...){
+    // do stuff
+}
+
+void onUpdate(...){
+    // do stuff
+}
+```
+and then in some way attach this script to a gameobject and have the `onUpdate` method automatically called every frame etc..
+
+So, lets do a hacky macro thing. In `fluxScript.h`, I have:
+```c
+#include "gameobject.h"
+#include <assert.h>
+
+#define fluxConcat_(X,Y) X ## _ ## Y
+#define fluxConcat(X,Y) fluxConcat_(X,Y)
+
+#ifdef SCRIPT
+
+#define fluxCallback static inline void
+
+#define onUpdate fluxConcat(SCRIPT,fluxCallback_onUpdate)
+#define afterUpdate fluxConcat(SCRIPT,fluxCallback_afterUpdate)
+#define onInit fluxConcat(SCRIPT,fluxCallback_onInit)
+#define onDestroy fluxConcat(SCRIPT,fluxCallback_onDestroy)
+#define onDraw fluxConcat(SCRIPT,fluxCallback_onDraw)
+#define onDraw2D fluxConcat(SCRIPT,fluxCallback_onDraw2D)
+#define script_data struct fluxConcat(SCRIPT,fluxData)
+
+#endif
+```
+The idea is that when I want to write a script, say `my_script.c`, I first `#define SCRIPT my_script` and then `#include "fluxScript.h"`. Then, I can write functions like:
+```c
+fluxCallback onUpdate(...){
+    ...
+}
+```
+which will be mangled accordingly. So, for example:
+```c
+#define SCRIPT test
+#include "fluxScript.h"
+
+script_data{
+    int x;
+};
+
+fluxCallback onInit(fluxGameObject obj, script_data* data){
+    data->x = 0;
+}
+
+fluxCallback onUpdate(fluxGameObject obj, script_data* data){
+    data->x++;
+}
+```
+Here, `script_data` is data associated with each instance of a script. We want a way to manage all of this automatically. We can do this using a hacky python preprocessing script.
+
+The basic idea is that we discover all scripts (by making the user have all of them in the same place), then gather them all into a single file and then write wrappers to let us do a kind of virtual dispatch on a generic `struct script` thing.
