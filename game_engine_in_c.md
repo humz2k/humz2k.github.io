@@ -218,3 +218,334 @@ fluxCallback onUpdate(fluxGameObject obj, script_data* data){
 Here, `script_data` is data associated with each instance of a script. We want a way to manage all of this automatically. We can do this using a hacky python preprocessing script.
 
 The basic idea is that we discover all scripts (by making the user have all of them in the same place), then gather them all into a single file and then write wrappers to let us do a kind of virtual dispatch on a generic `struct script` thing.
+
+In the python script we first need to specify all the possible callbacks. I'm doing this in a global variable because I am lazy, but this will probably change in the future as we want to add more callbacks.
+
+Starting off
+```python
+import sys
+import os
+import re
+
+SCRIPT_CALLBACKS = [
+    "onUpdate", "afterUpdate", "onInit", "onDestroy", "onDraw", "onDraw2D"
+]
+```
+
+Lets at least try to be pythonic and put the all of the script processing stuff in a `ScriptProcessor` class. We want to be able to specify all the paths etc rather than hardcoding so
+```python
+# processes all Flux scripts and creates `struct script`
+class ScriptProcessor:
+    def __init__(self, project_path : str = "project", scripts_folder : str = "scripts", engine_path : str = "engine", output_file : str = "GENERATED_SCRIPTS.h"):
+    # path of the project (where project_path/scripts is where all the scripts are)
+    self.project_path : str = project_path
+    # name of the scripts folder
+    self.scripts_folder : str = scripts_folder
+    # path of the scripts folder
+    self.scripts_path : str = os.path.join(self.project_path,self.scripts_folder)
+    # path of the engine sources
+    self.engine_path : str = engine_path
+    # name of the output scripts file
+    self.output_file : str = output_file
+    # path of the output scripts file
+    self.output_path : str = os.path.join(self.engine_path,output_file)
+```
+
+Now we need a way to find the scripts. We can do this with a disgusting one liner:
+```python
+# finds all `.c` files in `scripts_path`
+def find_scripts(self) -> list[str]:
+    return [os.path.join(self.scripts_path,i) for i in os.listdir(self.scripts_path) if i.split(".")[-1].strip() == "c"]
+```
+
+We might not want to implement all possible callbacks, so our script should figure out which callbacks we have implemented and auto generate the others. So
+```python
+# finds not implemented callbacks in a loaded script
+# this just looks for instances of the callback name,
+# SO, might get things wrong - be careful!
+# should probably change this in the future, so
+# TODO: fix me...
+def find_not_implemented(self, raw : str) -> list[str]:
+    return [i for i in SCRIPT_CALLBACKS if not i in raw]
+
+# given a callback name, return an empty `implementation`
+# i.e., a function that doesn't do anything
+def get_empty_implementation(self,callback : str) -> str:
+    return "fluxCallback {0}(fluxGameObject obj, script_data* data){{}}".format(callback)
+
+# gets implementations for all not implemented callbacks
+def get_extra_implementations(self, raw : str) -> str:
+    return "\n".join([self.get_empty_implementation(i) for i in self.find_not_implemented(raw)])
+```
+
+We also want to be able to parse the name of this script (this is how we will identify the script in code in the engine etc.).
+```python
+# parses the script name from the raw text
+# this is what SCRIPT is defined to at the start of the script,
+# so we can do two simple `splits` and a strip to get it
+def parse_script_name(self, raw : str) -> str:
+    return raw.split("#define SCRIPT")[1].split("\n")[0].strip()
+```
+
+We then have enough to write a simple script processor
+```python
+# processes a single script file
+def process_file(self, path : str) -> None:
+    with open(path,"r") as f:
+        raw = f.read()
+    raw += "\n\n" + self.get_extra_implementations(raw) + "\n\n"
+    self.output += raw
+    self.script_names.append(self.parse_script_name(raw))
+
+# process all scripts
+def process_scripts(self) -> None:
+    for i in self.scripts:
+        self.process_file(i)
+```
+
+The init function then becomes
+```python
+# processes all Flux scripts and creates `struct script`
+class ScriptProcessor:
+    def __init__(self, project_path : str = "project", scripts_folder : str = "scripts", engine_path : str = "engine", output_file : str = "GENERATED_SCRIPTS.h"):
+        # path of the project (where project_path/scripts is where all the scripts are)
+        self.project_path : str = project_path
+        # name of the scripts folder
+        self.scripts_folder : str = scripts_folder
+        # path of the scripts folder
+        self.scripts_path : str = os.path.join(self.project_path,self.scripts_folder)
+        # path of the engine sources
+        self.engine_path : str = engine_path
+        # name of the output scripts file
+        self.output_file : str = output_file
+        # path of the output scripts file
+        self.output_path : str = os.path.join(self.engine_path,output_file)
+        # list of all script files
+        self.scripts : list[str] = self.find_scripts()
+        # empty list of script names
+        # when we process a script, we add the name of it to this list
+        self.script_names : list[str] = []
+        # the output generated file (initially empty)
+        self.output : str = '#include "gameobject.h"\n#include "sceneallocator.h"\n' + "#ifdef FLUX_SCRIPTS_IMPLEMENTATION\n"
+        # now we can process all the scripts
+        self.process_scripts()
+```
+
+We want an enum to identify the scripts, so
+```python
+# generates `enum fluxScriptID`
+def generate_enum_script_id(self):
+    return "\nenum fluxScriptID{" + ",".join([get_script_enum_name(i) for i in self.script_names]) + "};\n"
+```
+`get_script_enum_name` is a function that mangles the script names into an enum. I am putting this in a separate file `pputils.py` because it will probably be useful in other preprocessing python scripts.
+
+Ok, I'm getting bored. There are a bunch of other similar preprocessing functions that essentially do this:
+* create a `fluxScript` data structure that is kind of a virtual class that contains all scripts.
+* we create a function to allocate a `fluxScript` given a `enum fluxScriptID`.
+* we then create functions for all the callbacks that operate on `fluxScript`s (so are ''generic'').
+
+At the end, the output from the python script looks something like:
+```c
+struct test_fluxData;
+struct test2_fluxData;
+#include "gameobject.h"
+#include "sceneallocator.h"
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+#define SCRIPT test
+#include "fluxScript.h"
+
+script_data{
+    int x;
+};
+
+fluxCallback onInit(fluxGameObject obj, script_data* data){
+    data->x = 0;
+}
+
+fluxCallback onUpdate(fluxGameObject obj, script_data* data){
+    data->x++;
+}
+
+fluxCallback afterUpdate(fluxGameObject obj, script_data* data){}
+fluxCallback onDestroy(fluxGameObject obj, script_data* data){}
+fluxCallback onDraw(fluxGameObject obj, script_data* data){}
+fluxCallback onDraw2D(fluxGameObject obj, script_data* data){}
+
+#define SCRIPT test2
+#include "fluxScript.h"
+
+script_data{
+    float y;
+};
+
+fluxCallback onInit(fluxGameObject obj, script_data* data){
+    data->y = 0;
+}
+
+fluxCallback onUpdate(fluxGameObject obj, script_data* data){}
+fluxCallback afterUpdate(fluxGameObject obj, script_data* data){}
+fluxCallback onDestroy(fluxGameObject obj, script_data* data){}
+fluxCallback onDraw(fluxGameObject obj, script_data* data){}
+fluxCallback onDraw2D(fluxGameObject obj, script_data* data){}
+#endif
+
+enum fluxScriptID{fluxScript_test,fluxScript_test2};
+
+struct fluxScriptStruct;
+typedef struct fluxScriptStruct* fluxScript;
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+struct fluxScriptStruct{
+    enum fluxScriptID id;
+    union {
+        void* raw;
+        struct test_fluxData* test_fluxData;
+        struct test2_fluxData* test2_fluxData;
+    };
+};
+#endif
+
+void fluxCallback_onUpdate(fluxGameObject obj, fluxScript script)
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+{
+    switch(script->id){
+        case fluxScript_test:
+            test_fluxCallback_onUpdate(obj,script->test_fluxData);
+            break;
+        case fluxScript_test2:
+            test2_fluxCallback_onUpdate(obj,script->test2_fluxData);
+            break;
+        default:
+            assert((1 == 0) && "something terrible happened at compile time!");
+            break;
+    }
+}
+#else
+;
+#endif
+
+void fluxCallback_afterUpdate(fluxGameObject obj, fluxScript script)
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+{
+    switch(script->id){
+        case fluxScript_test:
+            test_fluxCallback_afterUpdate(obj,script->test_fluxData);
+            break;
+        case fluxScript_test2:
+            test2_fluxCallback_afterUpdate(obj,script->test2_fluxData);
+            break;
+        default:
+            assert((1 == 0) && "something terrible happened at compile time!");
+            break;
+    }
+}
+#else
+;
+#endif
+
+void fluxCallback_onInit(fluxGameObject obj, fluxScript script)
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+{
+    switch(script->id){
+        case fluxScript_test:
+            test_fluxCallback_onInit(obj,script->test_fluxData);
+            break;
+        case fluxScript_test2:
+            test2_fluxCallback_onInit(obj,script->test2_fluxData);
+            break;
+        default:
+            assert((1 == 0) && "something terrible happened at compile time!");
+            break;
+    }
+}
+#else
+;
+#endif
+
+void fluxCallback_onDestroy(fluxGameObject obj, fluxScript script)
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+{
+    switch(script->id){
+        case fluxScript_test:
+            test_fluxCallback_onDestroy(obj,script->test_fluxData);
+            break;
+        case fluxScript_test2:
+            test2_fluxCallback_onDestroy(obj,script->test2_fluxData);
+            break;
+        default:
+            assert((1 == 0) && "something terrible happened at compile time!");
+            break;
+    }
+}
+#else
+;
+#endif
+
+void fluxCallback_onDraw(fluxGameObject obj, fluxScript script)
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+{
+    switch(script->id){
+        case fluxScript_test:
+            test_fluxCallback_onDraw(obj,script->test_fluxData);
+            break;
+        case fluxScript_test2:
+            test2_fluxCallback_onDraw(obj,script->test2_fluxData);
+            break;
+        default:
+            assert((1 == 0) && "something terrible happened at compile time!");
+            break;
+    }
+}
+#else
+;
+#endif
+
+void fluxCallback_onDraw2D(fluxGameObject obj, fluxScript script)
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+{
+    switch(script->id){
+        case fluxScript_test:
+            test_fluxCallback_onDraw2D(obj,script->test_fluxData);
+            break;
+        case fluxScript_test2:
+            test2_fluxCallback_onDraw2D(obj,script->test2_fluxData);
+            break;
+        default:
+            assert((1 == 0) && "something terrible happened at compile time!");
+            break;
+    }
+}
+#else
+;
+#endif
+
+fluxScript fluxAllocateScript(enum fluxScriptID id)
+#ifdef FLUX_SCRIPTS_IMPLEMENTATION
+{
+    fluxScript out = (fluxScript)flux_scene_alloc(sizeof(struct fluxScriptStruct));
+    out->id = id;
+    size_t sz = 0;
+    switch(id){
+        case fluxScript_test:
+            sz = sizeof(struct test_fluxData);
+            break;
+        case fluxScript_test2:
+            sz = sizeof(struct test2_fluxData);
+            break;
+        default:
+            assert((1 == 0) && "something terrible happened at build time!");
+            break;
+    }
+    out->raw = flux_scene_alloc(sz);
+    return out;
+}
+#else
+;
+#endif
+```
+
+which we then implement like
+```c
+#define FLUX_SCRIPTS_IMPLEMENTATION
+#include "GENERATED_SCRIPTS.h"
+```
+in a separate compilation unit.
