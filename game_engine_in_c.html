@@ -276,7 +276,375 @@ Model <span class="hljs-title function_">flux_scene_load_model</span><span class
     <span class="hljs-keyword">return</span> out;
 }
 </code></pre>
-<p>Next up: Prefabs and GameObjects!</p>
+<p>Next up: Scripts!</p>
+<h2 id="day-2-scripts">Day 2: Scripts</h2>
+<p>Ok, so we need a way to write scripts that will do stuff with game objects. We should be able to attach an arbitrary script to an arbitrary game object. If we were writing this in C++, we would maybe have each script inherit from a base <code>script</code> class and then use virtual dispatch.</p>
+<p>But we aren't doing that. So, lets do a hacky thing with macros and a python script. This keeps us in C world, but also should be faster than virtual dispatch - we can do everything with switch statements.</p>
+<p>My basic idea is that I want to be able to write a script (for example in <code>my_script.c</code>) where I can just fill in certain callback functions. For example, something like</p>
+<pre><code class="language-c"><span class="hljs-type">void</span> <span class="hljs-title function_">onInit</span><span class="hljs-params">(...)</span>{
+    <span class="hljs-comment">// do stuff</span>
+}
+
+<span class="hljs-type">void</span> <span class="hljs-title function_">onUpdate</span><span class="hljs-params">(...)</span>{
+    <span class="hljs-comment">// do stuff</span>
+}
+</code></pre>
+<p>and then in some way attach this script to a gameobject and have the <code>onUpdate</code> method automatically called every frame etc..</p>
+<p>So, lets do a hacky macro thing. In <code>fluxScript.h</code>, I have:</p>
+<pre><code class="language-c"><span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&quot;gameobject.h&quot;</span></span>
+<span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&lt;assert.h&gt;</span></span>
+
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> fluxConcat_(X,Y) X ## _ ## Y</span>
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> fluxConcat(X,Y) fluxConcat_(X,Y)</span>
+
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> SCRIPT</span>
+
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> fluxCallback static inline void</span>
+
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> onUpdate fluxConcat(SCRIPT,fluxCallback_onUpdate)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> afterUpdate fluxConcat(SCRIPT,fluxCallback_afterUpdate)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> onInit fluxConcat(SCRIPT,fluxCallback_onInit)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> onDestroy fluxConcat(SCRIPT,fluxCallback_onDestroy)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> onDraw fluxConcat(SCRIPT,fluxCallback_onDraw)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> onDraw2D fluxConcat(SCRIPT,fluxCallback_onDraw2D)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> script_data struct fluxConcat(SCRIPT,fluxData)</span>
+
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+</code></pre>
+<p>The idea is that when I want to write a script, say <code>my_script.c</code>, I first <code>#define SCRIPT my_script</code> and then <code>#include &quot;fluxScript.h&quot;</code>. Then, I can write functions like:</p>
+<pre><code class="language-c">fluxCallback <span class="hljs-title function_">onUpdate</span><span class="hljs-params">(...)</span>{
+    ...
+}
+</code></pre>
+<p>which will be mangled accordingly. So, for example:</p>
+<pre><code class="language-c"><span class="hljs-meta">#<span class="hljs-keyword">define</span> SCRIPT test</span>
+<span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&quot;fluxScript.h&quot;</span></span>
+
+script_data{
+    <span class="hljs-type">int</span> x;
+};
+
+fluxCallback <span class="hljs-title function_">onInit</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{
+    data-&gt;x = <span class="hljs-number">0</span>;
+}
+
+fluxCallback <span class="hljs-title function_">onUpdate</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{
+    data-&gt;x++;
+}
+</code></pre>
+<p>Here, <code>script_data</code> is data associated with each instance of a script. We want a way to manage all of this automatically. We can do this using a hacky python preprocessing script.</p>
+<p>The basic idea is that we discover all scripts (by making the user have all of them in the same place), then gather them all into a single file and then write wrappers to let us do a kind of virtual dispatch on a generic <code>struct script</code> thing.</p>
+<p>In the python script we first need to specify all the possible callbacks. I'm doing this in a global variable because I am lazy, but this will probably change in the future as we want to add more callbacks.</p>
+<p>Starting off</p>
+<pre><code class="language-python"><span class="hljs-keyword">import</span> sys
+<span class="hljs-keyword">import</span> os
+<span class="hljs-keyword">import</span> re
+
+SCRIPT_CALLBACKS = [
+    <span class="hljs-string">&quot;onUpdate&quot;</span>, <span class="hljs-string">&quot;afterUpdate&quot;</span>, <span class="hljs-string">&quot;onInit&quot;</span>, <span class="hljs-string">&quot;onDestroy&quot;</span>, <span class="hljs-string">&quot;onDraw&quot;</span>, <span class="hljs-string">&quot;onDraw2D&quot;</span>
+]
+</code></pre>
+<p>Lets at least try to be pythonic and put the all of the script processing stuff in a <code>ScriptProcessor</code> class. We want to be able to specify all the paths etc rather than hardcoding so</p>
+<pre><code class="language-python"><span class="hljs-comment"># processes all Flux scripts and creates `struct script`</span>
+<span class="hljs-keyword">class</span> <span class="hljs-title class_">ScriptProcessor</span>:
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">__init__</span>(<span class="hljs-params">self, project_path : <span class="hljs-built_in">str</span> = <span class="hljs-string">&quot;project&quot;</span>, scripts_folder : <span class="hljs-built_in">str</span> = <span class="hljs-string">&quot;scripts&quot;</span>, engine_path : <span class="hljs-built_in">str</span> = <span class="hljs-string">&quot;engine&quot;</span>, output_file : <span class="hljs-built_in">str</span> = <span class="hljs-string">&quot;GENERATED_SCRIPTS.h&quot;</span></span>):
+    <span class="hljs-comment"># path of the project (where project_path/scripts is where all the scripts are)</span>
+    self.project_path : <span class="hljs-built_in">str</span> = project_path
+    <span class="hljs-comment"># name of the scripts folder</span>
+    self.scripts_folder : <span class="hljs-built_in">str</span> = scripts_folder
+    <span class="hljs-comment"># path of the scripts folder</span>
+    self.scripts_path : <span class="hljs-built_in">str</span> = os.path.join(self.project_path,self.scripts_folder)
+    <span class="hljs-comment"># path of the engine sources</span>
+    self.engine_path : <span class="hljs-built_in">str</span> = engine_path
+    <span class="hljs-comment"># name of the output scripts file</span>
+    self.output_file : <span class="hljs-built_in">str</span> = output_file
+    <span class="hljs-comment"># path of the output scripts file</span>
+    self.output_path : <span class="hljs-built_in">str</span> = os.path.join(self.engine_path,output_file)
+</code></pre>
+<p>Now we need a way to find the scripts. We can do this with a disgusting one liner:</p>
+<pre><code class="language-python"><span class="hljs-comment"># finds all `.c` files in `scripts_path`</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">find_scripts</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-built_in">list</span>[<span class="hljs-built_in">str</span>]:
+    <span class="hljs-keyword">return</span> [os.path.join(self.scripts_path,i) <span class="hljs-keyword">for</span> i <span class="hljs-keyword">in</span> os.listdir(self.scripts_path) <span class="hljs-keyword">if</span> i.split(<span class="hljs-string">&quot;.&quot;</span>)[-<span class="hljs-number">1</span>].strip() == <span class="hljs-string">&quot;c&quot;</span>]
+</code></pre>
+<p>We might not want to implement all possible callbacks, so our script should figure out which callbacks we have implemented and auto generate the others. So</p>
+<pre><code class="language-python"><span class="hljs-comment"># finds not implemented callbacks in a loaded script</span>
+<span class="hljs-comment"># this just looks for instances of the callback name,</span>
+<span class="hljs-comment"># SO, might get things wrong - be careful!</span>
+<span class="hljs-comment"># should probably change this in the future, so</span>
+<span class="hljs-comment"># <span class="hljs-doctag">TODO:</span> fix me...</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">find_not_implemented</span>(<span class="hljs-params">self, raw : <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-built_in">list</span>[<span class="hljs-built_in">str</span>]:
+    <span class="hljs-keyword">return</span> [i <span class="hljs-keyword">for</span> i <span class="hljs-keyword">in</span> SCRIPT_CALLBACKS <span class="hljs-keyword">if</span> <span class="hljs-keyword">not</span> i <span class="hljs-keyword">in</span> raw]
+
+<span class="hljs-comment"># given a callback name, return an empty `implementation`</span>
+<span class="hljs-comment"># i.e., a function that doesn&#x27;t do anything</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">get_empty_implementation</span>(<span class="hljs-params">self,callback : <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;fluxCallback {0}(fluxGameObject obj, script_data* data){{}}&quot;</span>.<span class="hljs-built_in">format</span>(callback)
+
+<span class="hljs-comment"># gets implementations for all not implemented callbacks</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">get_extra_implementations</span>(<span class="hljs-params">self, raw : <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;\n&quot;</span>.join([self.get_empty_implementation(i) <span class="hljs-keyword">for</span> i <span class="hljs-keyword">in</span> self.find_not_implemented(raw)])
+</code></pre>
+<p>We also want to be able to parse the name of this script (this is how we will identify the script in code in the engine etc.).</p>
+<pre><code class="language-python"><span class="hljs-comment"># parses the script name from the raw text</span>
+<span class="hljs-comment"># this is what SCRIPT is defined to at the start of the script,</span>
+<span class="hljs-comment"># so we can do two simple `splits` and a strip to get it</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">parse_script_name</span>(<span class="hljs-params">self, raw : <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-built_in">str</span>:
+    <span class="hljs-keyword">return</span> raw.split(<span class="hljs-string">&quot;#define SCRIPT&quot;</span>)[<span class="hljs-number">1</span>].split(<span class="hljs-string">&quot;\n&quot;</span>)[<span class="hljs-number">0</span>].strip()
+</code></pre>
+<p>We then have enough to write a simple script processor</p>
+<pre><code class="language-python"><span class="hljs-comment"># processes a single script file</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">process_file</span>(<span class="hljs-params">self, path : <span class="hljs-built_in">str</span></span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">with</span> <span class="hljs-built_in">open</span>(path,<span class="hljs-string">&quot;r&quot;</span>) <span class="hljs-keyword">as</span> f:
+        raw = f.read()
+    raw += <span class="hljs-string">&quot;\n\n&quot;</span> + self.get_extra_implementations(raw) + <span class="hljs-string">&quot;\n\n&quot;</span>
+    self.output += raw
+    self.script_names.append(self.parse_script_name(raw))
+
+<span class="hljs-comment"># process all scripts</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">process_scripts</span>(<span class="hljs-params">self</span>) -&gt; <span class="hljs-literal">None</span>:
+    <span class="hljs-keyword">for</span> i <span class="hljs-keyword">in</span> self.scripts:
+        self.process_file(i)
+</code></pre>
+<p>The init function then becomes</p>
+<pre><code class="language-python"><span class="hljs-comment"># processes all Flux scripts and creates `struct script`</span>
+<span class="hljs-keyword">class</span> <span class="hljs-title class_">ScriptProcessor</span>:
+    <span class="hljs-keyword">def</span> <span class="hljs-title function_">__init__</span>(<span class="hljs-params">self, project_path : <span class="hljs-built_in">str</span> = <span class="hljs-string">&quot;project&quot;</span>, scripts_folder : <span class="hljs-built_in">str</span> = <span class="hljs-string">&quot;scripts&quot;</span>, engine_path : <span class="hljs-built_in">str</span> = <span class="hljs-string">&quot;engine&quot;</span>, output_file : <span class="hljs-built_in">str</span> = <span class="hljs-string">&quot;GENERATED_SCRIPTS.h&quot;</span></span>):
+        <span class="hljs-comment"># path of the project (where project_path/scripts is where all the scripts are)</span>
+        self.project_path : <span class="hljs-built_in">str</span> = project_path
+        <span class="hljs-comment"># name of the scripts folder</span>
+        self.scripts_folder : <span class="hljs-built_in">str</span> = scripts_folder
+        <span class="hljs-comment"># path of the scripts folder</span>
+        self.scripts_path : <span class="hljs-built_in">str</span> = os.path.join(self.project_path,self.scripts_folder)
+        <span class="hljs-comment"># path of the engine sources</span>
+        self.engine_path : <span class="hljs-built_in">str</span> = engine_path
+        <span class="hljs-comment"># name of the output scripts file</span>
+        self.output_file : <span class="hljs-built_in">str</span> = output_file
+        <span class="hljs-comment"># path of the output scripts file</span>
+        self.output_path : <span class="hljs-built_in">str</span> = os.path.join(self.engine_path,output_file)
+        <span class="hljs-comment"># list of all script files</span>
+        self.scripts : <span class="hljs-built_in">list</span>[<span class="hljs-built_in">str</span>] = self.find_scripts()
+        <span class="hljs-comment"># empty list of script names</span>
+        <span class="hljs-comment"># when we process a script, we add the name of it to this list</span>
+        self.script_names : <span class="hljs-built_in">list</span>[<span class="hljs-built_in">str</span>] = []
+        <span class="hljs-comment"># the output generated file (initially empty)</span>
+        self.output : <span class="hljs-built_in">str</span> = <span class="hljs-string">&#x27;#include &quot;gameobject.h&quot;\n#include &quot;sceneallocator.h&quot;\n&#x27;</span> + <span class="hljs-string">&quot;#ifdef FLUX_SCRIPTS_IMPLEMENTATION\n&quot;</span>
+        <span class="hljs-comment"># now we can process all the scripts</span>
+        self.process_scripts()
+</code></pre>
+<p>We want an enum to identify the scripts, so</p>
+<pre><code class="language-python"><span class="hljs-comment"># generates `enum fluxScriptID`</span>
+<span class="hljs-keyword">def</span> <span class="hljs-title function_">generate_enum_script_id</span>(<span class="hljs-params">self</span>):
+    <span class="hljs-keyword">return</span> <span class="hljs-string">&quot;\nenum fluxScriptID{&quot;</span> + <span class="hljs-string">&quot;,&quot;</span>.join([get_script_enum_name(i) <span class="hljs-keyword">for</span> i <span class="hljs-keyword">in</span> self.script_names]) + <span class="hljs-string">&quot;};\n&quot;</span>
+</code></pre>
+<p><code>get_script_enum_name</code> is a function that mangles the script names into an enum. I am putting this in a separate file <code>pputils.py</code> because it will probably be useful in other preprocessing python scripts.</p>
+<p>Ok, I'm getting bored. There are a bunch of other similar preprocessing functions that essentially do this:</p>
+<ul>
+<li>create a <code>fluxScript</code> data structure that is kind of a virtual class that contains all scripts.</li>
+<li>we create a function to allocate a <code>fluxScript</code> given a <code>enum fluxScriptID</code>.</li>
+<li>we then create functions for all the callbacks that operate on <code>fluxScript</code>s (so are ''generic'').</li>
+</ul>
+<p>At the end, the output from the python script looks something like:</p>
+<pre><code class="language-c"><span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">test_fluxData</span>;</span>
+<span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">test2_fluxData</span>;</span>
+<span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&quot;gameobject.h&quot;</span></span>
+<span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&quot;sceneallocator.h&quot;</span></span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> SCRIPT test</span>
+<span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&quot;fluxScript.h&quot;</span></span>
+
+script_data{
+    <span class="hljs-type">int</span> x;
+};
+
+fluxCallback <span class="hljs-title function_">onInit</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{
+    data-&gt;x = <span class="hljs-number">0</span>;
+}
+
+fluxCallback <span class="hljs-title function_">onUpdate</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{
+    data-&gt;x++;
+}
+
+fluxCallback <span class="hljs-title function_">afterUpdate</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+fluxCallback <span class="hljs-title function_">onDestroy</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+fluxCallback <span class="hljs-title function_">onDraw</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+fluxCallback <span class="hljs-title function_">onDraw2D</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+
+<span class="hljs-meta">#<span class="hljs-keyword">define</span> SCRIPT test2</span>
+<span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&quot;fluxScript.h&quot;</span></span>
+
+script_data{
+    <span class="hljs-type">float</span> y;
+};
+
+fluxCallback <span class="hljs-title function_">onInit</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{
+    data-&gt;y = <span class="hljs-number">0</span>;
+}
+
+fluxCallback <span class="hljs-title function_">onUpdate</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+fluxCallback <span class="hljs-title function_">afterUpdate</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+fluxCallback <span class="hljs-title function_">onDestroy</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+fluxCallback <span class="hljs-title function_">onDraw</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+fluxCallback <span class="hljs-title function_">onDraw2D</span><span class="hljs-params">(fluxGameObject obj, script_data* data)</span>{}
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+
+<span class="hljs-class"><span class="hljs-keyword">enum</span> <span class="hljs-title">fluxScriptID</span>{</span>fluxScript_test,fluxScript_test2};
+
+<span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">fluxScriptStruct</span>;</span>
+<span class="hljs-keyword">typedef</span> <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">fluxScriptStruct</span>* <span class="hljs-title">fluxScript</span>;</span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+<span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">fluxScriptStruct</span>{</span>
+    <span class="hljs-class"><span class="hljs-keyword">enum</span> <span class="hljs-title">fluxScriptID</span> <span class="hljs-title">id</span>;</span>
+    <span class="hljs-class"><span class="hljs-keyword">union</span> {</span>
+        <span class="hljs-type">void</span>* raw;
+        <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">test_fluxData</span>* <span class="hljs-title">test_fluxData</span>;</span>
+        <span class="hljs-class"><span class="hljs-keyword">struct</span> <span class="hljs-title">test2_fluxData</span>* <span class="hljs-title">test2_fluxData</span>;</span>
+    };
+};
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+
+<span class="hljs-type">void</span> <span class="hljs-title function_">fluxCallback_onUpdate</span><span class="hljs-params">(fluxGameObject obj, fluxScript script)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+{
+    <span class="hljs-keyword">switch</span>(script-&gt;id){
+        <span class="hljs-keyword">case</span> fluxScript_test:
+            test_fluxCallback_onUpdate(obj,script-&gt;test_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> fluxScript_test2:
+            test2_fluxCallback_onUpdate(obj,script-&gt;test2_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">default</span>:
+            assert((<span class="hljs-number">1</span> == <span class="hljs-number">0</span>) &amp;&amp; <span class="hljs-string">&quot;something terrible happened at compile time!&quot;</span>);
+            <span class="hljs-keyword">break</span>;
+    }
+}
+<span class="hljs-meta">#<span class="hljs-keyword">else</span></span>
+;
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+
+<span class="hljs-type">void</span> <span class="hljs-title function_">fluxCallback_afterUpdate</span><span class="hljs-params">(fluxGameObject obj, fluxScript script)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+{
+    <span class="hljs-keyword">switch</span>(script-&gt;id){
+        <span class="hljs-keyword">case</span> fluxScript_test:
+            test_fluxCallback_afterUpdate(obj,script-&gt;test_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> fluxScript_test2:
+            test2_fluxCallback_afterUpdate(obj,script-&gt;test2_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">default</span>:
+            assert((<span class="hljs-number">1</span> == <span class="hljs-number">0</span>) &amp;&amp; <span class="hljs-string">&quot;something terrible happened at compile time!&quot;</span>);
+            <span class="hljs-keyword">break</span>;
+    }
+}
+<span class="hljs-meta">#<span class="hljs-keyword">else</span></span>
+;
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+
+<span class="hljs-type">void</span> <span class="hljs-title function_">fluxCallback_onInit</span><span class="hljs-params">(fluxGameObject obj, fluxScript script)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+{
+    <span class="hljs-keyword">switch</span>(script-&gt;id){
+        <span class="hljs-keyword">case</span> fluxScript_test:
+            test_fluxCallback_onInit(obj,script-&gt;test_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> fluxScript_test2:
+            test2_fluxCallback_onInit(obj,script-&gt;test2_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">default</span>:
+            assert((<span class="hljs-number">1</span> == <span class="hljs-number">0</span>) &amp;&amp; <span class="hljs-string">&quot;something terrible happened at compile time!&quot;</span>);
+            <span class="hljs-keyword">break</span>;
+    }
+}
+<span class="hljs-meta">#<span class="hljs-keyword">else</span></span>
+;
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+
+<span class="hljs-type">void</span> <span class="hljs-title function_">fluxCallback_onDestroy</span><span class="hljs-params">(fluxGameObject obj, fluxScript script)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+{
+    <span class="hljs-keyword">switch</span>(script-&gt;id){
+        <span class="hljs-keyword">case</span> fluxScript_test:
+            test_fluxCallback_onDestroy(obj,script-&gt;test_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> fluxScript_test2:
+            test2_fluxCallback_onDestroy(obj,script-&gt;test2_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">default</span>:
+            assert((<span class="hljs-number">1</span> == <span class="hljs-number">0</span>) &amp;&amp; <span class="hljs-string">&quot;something terrible happened at compile time!&quot;</span>);
+            <span class="hljs-keyword">break</span>;
+    }
+}
+<span class="hljs-meta">#<span class="hljs-keyword">else</span></span>
+;
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+
+<span class="hljs-type">void</span> <span class="hljs-title function_">fluxCallback_onDraw</span><span class="hljs-params">(fluxGameObject obj, fluxScript script)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+{
+    <span class="hljs-keyword">switch</span>(script-&gt;id){
+        <span class="hljs-keyword">case</span> fluxScript_test:
+            test_fluxCallback_onDraw(obj,script-&gt;test_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> fluxScript_test2:
+            test2_fluxCallback_onDraw(obj,script-&gt;test2_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">default</span>:
+            assert((<span class="hljs-number">1</span> == <span class="hljs-number">0</span>) &amp;&amp; <span class="hljs-string">&quot;something terrible happened at compile time!&quot;</span>);
+            <span class="hljs-keyword">break</span>;
+    }
+}
+<span class="hljs-meta">#<span class="hljs-keyword">else</span></span>
+;
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+
+<span class="hljs-type">void</span> <span class="hljs-title function_">fluxCallback_onDraw2D</span><span class="hljs-params">(fluxGameObject obj, fluxScript script)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+{
+    <span class="hljs-keyword">switch</span>(script-&gt;id){
+        <span class="hljs-keyword">case</span> fluxScript_test:
+            test_fluxCallback_onDraw2D(obj,script-&gt;test_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> fluxScript_test2:
+            test2_fluxCallback_onDraw2D(obj,script-&gt;test2_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">default</span>:
+            assert((<span class="hljs-number">1</span> == <span class="hljs-number">0</span>) &amp;&amp; <span class="hljs-string">&quot;something terrible happened at compile time!&quot;</span>);
+            <span class="hljs-keyword">break</span>;
+    }
+}
+<span class="hljs-meta">#<span class="hljs-keyword">else</span></span>
+;
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+
+fluxScript <span class="hljs-title function_">fluxAllocateScript</span><span class="hljs-params">(<span class="hljs-keyword">enum</span> fluxScriptID id)</span>
+<span class="hljs-meta">#<span class="hljs-keyword">ifdef</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+{
+    fluxScript out = (fluxScript)flux_scene_alloc(<span class="hljs-keyword">sizeof</span>(<span class="hljs-keyword">struct</span> fluxScriptStruct));
+    out-&gt;id = id;
+    <span class="hljs-type">size_t</span> sz = <span class="hljs-number">0</span>;
+    <span class="hljs-keyword">switch</span>(id){
+        <span class="hljs-keyword">case</span> fluxScript_test:
+            sz = <span class="hljs-keyword">sizeof</span>(<span class="hljs-keyword">struct</span> test_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">case</span> fluxScript_test2:
+            sz = <span class="hljs-keyword">sizeof</span>(<span class="hljs-keyword">struct</span> test2_fluxData);
+            <span class="hljs-keyword">break</span>;
+        <span class="hljs-keyword">default</span>:
+            assert((<span class="hljs-number">1</span> == <span class="hljs-number">0</span>) &amp;&amp; <span class="hljs-string">&quot;something terrible happened at build time!&quot;</span>);
+            <span class="hljs-keyword">break</span>;
+    }
+    out-&gt;raw = flux_scene_alloc(sz);
+    <span class="hljs-keyword">return</span> out;
+}
+<span class="hljs-meta">#<span class="hljs-keyword">else</span></span>
+;
+<span class="hljs-meta">#<span class="hljs-keyword">endif</span></span>
+</code></pre>
+<p>which we then implement like</p>
+<pre><code class="language-c"><span class="hljs-meta">#<span class="hljs-keyword">define</span> FLUX_SCRIPTS_IMPLEMENTATION</span>
+<span class="hljs-meta">#<span class="hljs-keyword">include</span> <span class="hljs-string">&quot;GENERATED_SCRIPTS.h&quot;</span></span>
+</code></pre>
+<p>in a separate compilation unit.</p>
 
             
             
